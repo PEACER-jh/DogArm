@@ -23,7 +23,6 @@ from ....robots.go2arm import (
     EE_BODY_NAME,
     GO2ARM_CFG,
     LEG_JOINT_NAMES,
-    NUM_DOFS,
 )
 
 
@@ -32,6 +31,9 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     """Configuration for the DogArm direct RL environment."""
 
     # -- Environment --
+    # -- Task mode ("velocity" | "navigation") --
+    task_mode: str = "velocity"
+
     decimation: int = 4  # 200Hz sim → 50Hz control
     episode_length_s: float = 20.0
 
@@ -45,10 +47,6 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     # State: observation + priv info for critic
     #   + joint_torques(18) + feet_contact(4)
     state_space: int = 61 + 18 + 4  # 83
-
-    # TODO(target): restore when adding navigation
-    # observation_space: int = 3 + 18 + 18 + 18 + 3 + 7 + 3 + 3 + 1 + 2  # 76 (+target)
-    # state_space: int = 76 + 3 + 18 + 4  # 101
 
     # -- Observation groups for asymmetric actor-critic --
     obs_groups: dict[str, list[str]] = {
@@ -93,17 +91,20 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     arm_action_scale: float = 0.0  # TODO(arm): set to 0.5 when adding arm tasks
 
     # ========================================================================
-    # Command generation — velocity tracking baseline (Go2Arm_Lab style)
+    # Command generation
     # ========================================================================
-    # TODO(target): restore when adding navigation
-    # target_distance_range: tuple[float, float] = (1.5, 4.0)
-    # target_reach_threshold: float = 0.3
-
     # Velocity heading command — world-frame heading + body-frame speed
     # Robot must turn to match the world-frame heading then walk at the given speed.
     vel_cmd_speed_range_init: tuple[float, float] = (0.05, 0.3)
-    vel_cmd_speed_range_final: tuple[float, float] = (0.1, 1.5)  # higher top speed
-    vel_cmd_heading_range: tuple[float, float] = (-3.14, 3.14)  # world-frame, random
+    vel_cmd_speed_range_final: tuple[float, float] = (0.1, 1.5)
+    vel_cmd_heading_range: tuple[float, float] = (-3.14, 3.14)
+
+    # -- Navigation mode params --
+    target_distance_range: tuple[float, float] = (1.5, 4.0)
+    target_reach_threshold: float = 0.3
+    rew_target_progress: float = 8.0
+    rew_target_reach: float = 20.0
+    rew_target_alignment: float = 1.0
     vel_cmd_resample_time_range: tuple[float, float] = (10.0, 10.0)  # Go2Arm_Lab: 10s
 
     # TODO(target+EE): restore when adding navigation + manipulation
@@ -117,19 +118,16 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     curriculum_coeff: int = 1000
 
     # ========================================================================
-    # Reward weights — Go2Arm_Lab locomotion baseline
+    # Reward weights
     # ========================================================================
-    # TODO(target): restore when adding navigation
-    # rew_target_progress: float = 8.0
-    # rew_target_reach: float = 20.0
-    # rew_target_alignment: float = 1.0
+    # TODO(arm): rew_ee_* when adding manipulation
     # ee_active_dist_threshold: float = 1.0
     # rew_ee_pos_tracking: float = 2.5
     # rew_ee_ori_tracking: float = -1.5
     # rew_ee_action_rate: float = -0.005
     # rew_ee_action_smoothness: float = -0.02
 
-    # Velocity tracking (exact Isaac-Velocity-Flat-Unitree-Go2-v0 weights)
+    # Velocity tracking
     rew_lin_vel_tracking: float = 1.5
     rew_ang_vel_tracking: float = 0.75
 

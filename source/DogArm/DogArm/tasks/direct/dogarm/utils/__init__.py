@@ -5,4 +5,4 @@
 
 """Utility modules for the DogArm DirectRL environment."""
 
-from . import commands, domain_rand, rewards  # noqa: F401
+from . import commands, rewards  # noqa: F401

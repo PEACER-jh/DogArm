@@ -35,6 +35,7 @@ from typing import Optional, cast
 import torch
 
 import isaaclab.sim as sim_utils
+import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
@@ -42,15 +43,29 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from .dogarm_env_cfg import DogarmEnvCfg
 from .utils.rewards import (
     action_rate_l2,
-    ang_vel_tracking_exp,
     ang_vel_xy_l2,
     dof_acc_l2,
     dof_torques_l2,
     flat_orientation_l2,
     gait_trot_penalty,
-    lin_vel_tracking_exp,
     lin_vel_z_l2,
 )
+from .utils.velocity.rewards import (
+    ang_vel_tracking_exp,
+    lin_vel_tracking_exp,
+)
+from .utils.domain_rand import (
+    add_observation_noise,
+    apply_push_velocity,
+    init_push_timers,
+    randomize_joint_positions,
+    randomize_root_state,
+)
+from .utils.velocity import commands as vel_cmd
+from .utils.velocity import observations as vel_obs
+from .utils.navigation import commands as nav_cmd
+from .utils.navigation import rewards as nav_rewards
+from .utils.navigation import observations as nav_obs
 
 
 class DogarmEnv(DirectRLEnv):
@@ -91,6 +106,9 @@ class DogarmEnv(DirectRLEnv):
     ee_tgt_frame_markers: object
 
     def __init__(self, cfg: DogarmEnvCfg, render_mode: Optional[str] = None, **kwargs: object) -> None:
+        # Set observation dim based on task mode (must happen before super().__init__)
+        if cfg.task_mode == "navigation":
+            cfg.observation_space = 67  # velocity(61) + target(6)
         super().__init__(cfg, render_mode, **kwargs)
 
         # Joints
@@ -127,6 +145,11 @@ class DogarmEnv(DirectRLEnv):
         self.prev_leg_dof_vel = torch.zeros(self.num_envs, 12, device=self.device)
         self._curriculum_step = 0
 
+        # Navigation mode extras
+        if cfg.task_mode == "navigation":
+            self.target_pos = torch.zeros(self.num_envs, 3, device=self.device)
+            self._prev_distance = torch.zeros(self.num_envs, device=self.device)
+
     # === Scene ================================================================
 
     def _setup_scene(self) -> None:
@@ -145,32 +168,19 @@ class DogarmEnv(DirectRLEnv):
         self.ee_tgt_frame_markers = _vt.define_ee_frame_markers("/Visuals/DogArm/EETgtFrame", scale=(0.1, 0.1, 0.1))
 
     def _heading_to_body_vel(self) -> None:
-        """Convert world-frame heading + speed → body-frame velocity command.
-
-        vx: always forward (> 0), proportional to alignment
-        wz: turn toward heading, strong when far, gentle when close
-        vy: 0 (keep it simple for baseline)
-        """
-        import isaaclab.utils.math as _mu
-        fwd = _mu.quat_apply(self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B)
-        robot_yaw = torch.atan2(fwd[:, 1], fwd[:, 0])
-        heading_err = self.cmd_heading_w - robot_yaw
-        heading_err = torch.atan2(torch.sin(heading_err), torch.cos(heading_err))  # wrap
-
-        self.vel_commands[:, 0] = self.cmd_speed * heading_err.cos().clamp(min=0.2)
-        self.vel_commands[:, 1] = 0.0
-        self.vel_commands[:, 2] = torch.clamp(heading_err, -1.0, 1.0)
+        """Delegate to velocity command module."""
+        vel_cmd.heading_to_body_vel(
+            self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B,
+            self.cmd_heading_w, self.cmd_speed, self.vel_commands,
+        )
 
     def _resample_heading_command(self, env_ids: torch.Tensor) -> None:
-        """Sample new world-frame heading + speed for the given envs."""
-        n = len(env_ids)
-        t_val = min(1.0, self._curriculum_step / (1 * self.cfg.curriculum_coeff))
-        sp_lo = self.cfg.vel_cmd_speed_range_init[0] * (1 - t_val) + self.cfg.vel_cmd_speed_range_final[0] * t_val
-        sp_hi = self.cfg.vel_cmd_speed_range_init[1] * (1 - t_val) + self.cfg.vel_cmd_speed_range_final[1] * t_val
-        self.cmd_speed[env_ids] = torch.rand(n, device=self.device) * (sp_hi - sp_lo) + sp_lo
-        self.cmd_heading_w[env_ids] = torch.rand(n, device=self.device) * (
-            self.cfg.vel_cmd_heading_range[1] - self.cfg.vel_cmd_heading_range[0]
-        ) + self.cfg.vel_cmd_heading_range[0]
+        """Delegate to velocity command module."""
+        self.cmd_speed[env_ids], self.cmd_heading_w[env_ids] = vel_cmd.resample_heading_command(
+            len(env_ids), self._curriculum_step, self.cfg.curriculum_coeff,
+            self.cfg.vel_cmd_speed_range_init, self.cfg.vel_cmd_speed_range_final,
+            self.cfg.vel_cmd_heading_range, self.device,
+        )
 
     # === Step =================================================================
 
@@ -181,14 +191,38 @@ class DogarmEnv(DirectRLEnv):
 
         self.vel_cmd_timers -= self.step_dt
         vel_needs = self.vel_cmd_timers <= 0.0
-        if vel_needs.any():
-            vel_ids = torch.where(vel_needs)[0]
-            self._resample_heading_command(vel_ids)
-            dr = self.cfg.vel_cmd_resample_time_range
-            self.vel_cmd_timers[vel_ids] = torch.rand(len(vel_ids), device=self.device) * (dr[1] - dr[0]) + dr[0]
 
-        # Convert heading → body-frame velocity command
-        self._heading_to_body_vel()
+        if self.cfg.task_mode == "velocity":
+            if vel_needs.any():
+                vel_ids = torch.where(vel_needs)[0]
+                self._resample_heading_command(vel_ids)
+                dr = self.cfg.vel_cmd_resample_time_range
+                self.vel_cmd_timers[vel_ids] = torch.rand(len(vel_ids), device=self.device) * (dr[1] - dr[0]) + dr[0]
+            self._heading_to_body_vel()
+        else:  # navigation
+            if vel_needs.any():
+                vel_ids = torch.where(vel_needs)[0]
+                new_cmds = nav_cmd.velocity_toward_target(
+                    vel_ids, self.robot.data.root_pos_w[:, :2], self.target_pos,
+                    self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B,
+                    self._curriculum_step, self.cfg.curriculum_coeff,
+                    self.cfg.vel_cmd_speed_range_init, self.cfg.vel_cmd_speed_range_final,
+                    self.device,
+                )
+                self.vel_commands[vel_ids] = new_cmds
+                dr = self.cfg.vel_cmd_resample_time_range
+                self.vel_cmd_timers[vel_ids] = torch.rand(len(vel_ids), device=self.device) * (dr[1] - dr[0]) + dr[0]
+            else:
+                # Update toward-target vel every step (heading changes as robot moves)
+                new_cmds = nav_cmd.velocity_toward_target(
+                    torch.arange(self.num_envs, device=self.device),
+                    self.robot.data.root_pos_w[:, :2], self.target_pos,
+                    self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B,
+                    self._curriculum_step, self.cfg.curriculum_coeff,
+                    self.cfg.vel_cmd_speed_range_init, self.cfg.vel_cmd_speed_range_final,
+                    self.device,
+                )
+                self.vel_commands = new_cmds
 
         # Markers after commands are fresh
         if self.render_mode != "headless":
@@ -216,19 +250,29 @@ class DogarmEnv(DirectRLEnv):
         vel_cmds = self.vel_commands
         projected_gravity = self.robot.data.projected_gravity_b
         base_height = torch.clamp(self.robot.data.root_pos_w[:, 2:3], max=0.4)
+        root_pos = self.robot.data.root_pos_w
+        root_quat = self.robot.data.root_quat_w
 
         # Observation noise (official Go2 domain randomization)
-        base_lin_vel += (torch.rand_like(base_lin_vel) * 2 - 1) * self.cfg.obs_noise_base_lin_vel
-        base_ang_vel += (torch.rand_like(base_ang_vel) * 2 - 1) * self.cfg.obs_noise_base_ang_vel
-        projected_gravity += (torch.rand_like(projected_gravity) * 2 - 1) * self.cfg.obs_noise_projected_gravity
-        joint_pos_rel += (torch.rand_like(joint_pos_rel) * 2 - 1) * self.cfg.obs_noise_joint_pos
-        joint_vel_rel += (torch.rand_like(joint_vel_rel) * 2 - 1) * self.cfg.obs_noise_joint_vel
+        if self.cfg.obs_noise_base_lin_vel:
+            add_observation_noise(base_lin_vel, self.cfg.obs_noise_base_lin_vel)
+            add_observation_noise(base_ang_vel, self.cfg.obs_noise_base_ang_vel)
+            add_observation_noise(projected_gravity, self.cfg.obs_noise_projected_gravity)
+            add_observation_noise(joint_pos_rel, self.cfg.obs_noise_joint_pos)
+            add_observation_noise(joint_vel_rel, self.cfg.obs_noise_joint_vel)
 
-        # 67-dim policy observation (includes base_lin_vel for speed feedback)
-        policy_obs = torch.cat([
-            base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
-            prev_actions, vel_cmds, projected_gravity, base_height,
-        ], dim=-1)  # (B, 67)
+        # Build policy observation (61-dim velocity / 67-dim navigation)
+        if self.cfg.task_mode == "velocity":
+            policy_obs = vel_obs.build_policy_obs(
+                base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
+                prev_actions, vel_cmds, projected_gravity, base_height,
+            )  # (B, 61)
+        else:
+            policy_obs = nav_obs.build_policy_obs(
+                base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
+                prev_actions, vel_cmds, projected_gravity, base_height,
+                self.target_pos, root_pos, root_quat, self.robot.data.FORWARD_VEC_B,
+            )  # (B, 67)
 
         # History stacking
         hlen = self.cfg.num_obs_history_steps
@@ -273,11 +317,12 @@ class DogarmEnv(DirectRLEnv):
         # === Reward terms (Go2Arm_Lab locomotion baseline) ===
         rewards = torch.zeros(self.num_envs, device=self.device)
 
-        # Velocity tracking
-        rewards += self.cfg.rew_lin_vel_tracking * lin_vel_tracking_exp(
-            vel_cmd[:, :2], root_lin_vel_b[:, :2], self.cfg.lin_vel_tracking_std)
-        rewards += self.cfg.rew_ang_vel_tracking * ang_vel_tracking_exp(
-            vel_cmd[:, 2], root_ang_vel_b[:, 2], self.cfg.ang_vel_tracking_std)
+        # Velocity tracking (velocity mode only — this IS the task)
+        if self.cfg.task_mode == "velocity":
+            rewards += self.cfg.rew_lin_vel_tracking * lin_vel_tracking_exp(
+                vel_cmd[:, :2], root_lin_vel_b[:, :2], self.cfg.lin_vel_tracking_std)
+            rewards += self.cfg.rew_ang_vel_tracking * ang_vel_tracking_exp(
+                vel_cmd[:, 2], root_ang_vel_b[:, 2], self.cfg.ang_vel_tracking_std)
 
         # Stability
         rewards += self.cfg.rew_lin_vel_z * lin_vel_z_l2(root_lin_vel_b[:, 2])
@@ -313,7 +358,18 @@ class DogarmEnv(DirectRLEnv):
         # Long air: penalize any foot lifted >70% of the time
         rewards += self.cfg.rew_feet_long_air * torch.sum((self._foot_air_accum > 0.7).float(), dim=-1)
 
-        # TODO(target): restore target_progress, target_reach, target_alignment
+        # Navigation rewards
+        if self.cfg.task_mode == "navigation":
+            target_dist = torch.norm(self.target_pos[:, :2] - root_pos_w[:, :2], dim=-1)
+            rewards += self.cfg.rew_target_progress * nav_rewards.target_progress(
+                self._prev_distance, target_dist)
+            rewards += self.cfg.rew_target_reach * nav_rewards.target_reach(
+                target_dist, self.cfg.target_reach_threshold)
+            fwd_w = math_utils.quat_apply(self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B)[:, :2]
+            tgt_dir = (self.target_pos[:, :2] - root_pos_w[:, :2]) / (target_dist.unsqueeze(-1) + 1e-6)
+            rewards += self.cfg.rew_target_alignment * nav_rewards.target_alignment(fwd_w, tgt_dir)
+            self._prev_distance = target_dist
+
         # TODO(arm): restore ee_pos_tracking, ee_ori_tracking, ee_action_rate, ee_action_smoothness
 
         self.prev_actions = actions.clone()
@@ -351,30 +407,18 @@ class DogarmEnv(DirectRLEnv):
             return
 
         super()._reset_idx(ids)
-        n = ids.numel()
 
-        # Root state
-        default_root = self.robot.data.default_root_state[ids].clone()
-        default_root[:, :3] += self.scene.env_origins[ids]
-        for i, key in enumerate(("x", "y")):
-            lo, hi = self.cfg.dr_pose_range[key]
-            default_root[:, i] += torch.rand(n, device=self.device) * (hi - lo) + lo
-        yaw_lo, yaw_hi = self.cfg.dr_pose_range["yaw"]
-        rand_yaw = torch.rand(n, device=self.device) * (yaw_hi - yaw_lo) + yaw_lo
-        default_root[:, 3] = torch.cos(rand_yaw / 2.0)
-        default_root[:, 4] = 0.0
-        default_root[:, 5] = 0.0
-        default_root[:, 6] = torch.sin(rand_yaw / 2.0)
-        for i, key in enumerate(("x", "y", "z")):
-            if key in self.cfg.dr_velocity_range:
-                lo, hi = self.cfg.dr_velocity_range[key]
-                default_root[:, 7 + i] += torch.rand(n, device=self.device) * (hi - lo) + lo
+        # Root state randomization
+        default_root = randomize_root_state(
+            self.robot.data.default_root_state, self.scene.env_origins, ids,
+            self.cfg.dr_pose_range, self.cfg.dr_velocity_range, self.device,
+        )
 
-        # Joint randomization
-        joint_pos = self.robot.data.default_joint_pos[ids].clone()
-        dr_lo, dr_hi = self.cfg.dr_joint_pos_range
-        rand_scale = torch.rand(ids.numel(), 1, device=self.device) * (dr_hi - dr_lo) + dr_lo
-        joint_pos = joint_pos * rand_scale
+        # Joint position randomization
+        joint_pos = randomize_joint_positions(
+            self.robot.data.default_joint_pos, ids,
+            self.cfg.dr_joint_pos_range, self.device,
+        )
 
         self.robot.write_root_state_to_sim(default_root, ids)
         self.robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos), None, ids)
@@ -385,8 +429,13 @@ class DogarmEnv(DirectRLEnv):
         self.prev_leg_dof_vel[ids] = 0.0
         self.obs_history[ids] = 0.0
 
-        # TODO(target): restore target_pos generation
-        # TODO(arm): restore ee_pose_commands generation
+        # Navigation: generate target point
+        if self.cfg.task_mode == "navigation":
+            robot_xy = self.robot.data.root_pos_w[:, :2]
+            self.target_pos[ids] = nav_cmd.sample_target_points(
+                ids, robot_xy, self.cfg.target_distance_range, self.device)
+            self._prev_distance[ids] = torch.norm(
+                self.target_pos[ids, :2] - robot_xy[ids], dim=-1)
 
         # Initial heading command (world-frame heading + speed)
         self._resample_heading_command(ids)
@@ -401,22 +450,19 @@ class DogarmEnv(DirectRLEnv):
 
     def _init_push_timers(self, env_ids: torch.Tensor | None = None) -> None:
         _env_ids = torch.arange(self.num_envs, device=self.device) if env_ids is None else env_ids
-        lo, hi = self.cfg.dr_push_interval_range
-        self.push_timers[_env_ids] = torch.rand(_env_ids.numel(), device=self.device) * (hi - lo) + lo
+        self.push_timers[_env_ids] = init_push_timers(
+            self.num_envs, env_ids, self.cfg.dr_push_interval_range, self.device)
 
     def _update_push(self) -> None:
         self.push_timers -= self.step_dt
         needs_push = self.push_timers <= 0.0
         if needs_push.any():
             push_ids = torch.where(needs_push)[0]
-            n = push_ids.numel()
-            push_vel = torch.zeros(self.num_envs, 6, device=self.device)
-            for i, key in enumerate(("x", "y")):
-                lo, hi = self.cfg.dr_push_range[key]
-                push_vel[push_ids, i] = torch.rand(n, device=self.device) * (hi - lo) + lo
+            push_vel = apply_push_velocity(
+                self.num_envs, push_ids, self.cfg.dr_push_range, self.device)
             self.robot.write_root_velocity_to_sim(push_vel[push_ids], push_ids)
-            lo, hi = self.cfg.dr_push_interval_range
-            self.push_timers[push_ids] = torch.rand(n, device=self.device) * (hi - lo) + lo
+            self.push_timers[push_ids] = init_push_timers(
+                self.num_envs, push_ids, self.cfg.dr_push_interval_range, self.device)
 
     # === Viz ==================================================================
 
