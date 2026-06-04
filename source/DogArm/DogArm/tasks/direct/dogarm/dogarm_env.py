@@ -47,6 +47,7 @@ from .utils.rewards import (
     dof_acc_l2,
     dof_torques_l2,
     flat_orientation_l2,
+    gait_trot_penalty,
     lin_vel_tracking_exp,
     lin_vel_z_l2,
 )
@@ -299,6 +300,18 @@ class DogarmEnv(DirectRLEnv):
             self._foot_air_accum = torch.zeros(self.num_envs, 4, device=self.device)
         self._foot_air_accum = 0.8 * self._foot_air_accum + 0.2 * foot_in_air
         rewards += self.cfg.rew_feet_air_time * torch.sum(self._foot_air_accum, dim=-1)
+
+        # Gait posture (LegoManip: symmetry + rhythm)
+        rewards += self.cfg.rew_joint_mirror * gait_trot_penalty(joint_pos)
+        # Air time variance: penalize irregular stepping (one foot lifted much longer than others)
+        air_var = torch.var(self._foot_air_accum, dim=-1)
+        rewards += self.cfg.rew_air_time_variance * air_var
+        # Foot slide: penalize foot velocity when near ground
+        foot_vel = self.robot.data.body_lin_vel_w[:, self.foot_body_idx]  # (B, 4, 3)
+        foot_slide = torch.norm(foot_vel[:, :, :2], dim=-1) * (foot_h < 0.03).float()
+        rewards += self.cfg.rew_feet_slide * torch.sum(foot_slide, dim=-1)
+        # Long air: penalize any foot lifted >70% of the time
+        rewards += self.cfg.rew_feet_long_air * torch.sum((self._foot_air_accum > 0.7).float(), dim=-1)
 
         # TODO(target): restore target_progress, target_reach, target_alignment
         # TODO(arm): restore ee_pos_tracking, ee_ori_tracking, ee_action_rate, ee_action_smoothness

@@ -101,8 +101,8 @@ class DogarmEnvCfg(DirectRLEnvCfg):
 
     # Velocity heading command — world-frame heading + body-frame speed
     # Robot must turn to match the world-frame heading then walk at the given speed.
-    vel_cmd_speed_range_init: tuple[float, float] = (0.05, 0.2)  # LeggedManip: baby steps first
-    vel_cmd_speed_range_final: tuple[float, float] = (0.1, 1.0)
+    vel_cmd_speed_range_init: tuple[float, float] = (0.05, 0.3)
+    vel_cmd_speed_range_final: tuple[float, float] = (0.1, 1.5)  # higher top speed
     vel_cmd_heading_range: tuple[float, float] = (-3.14, 3.14)  # world-frame, random
     vel_cmd_resample_time_range: tuple[float, float] = (10.0, 10.0)  # Go2Arm_Lab: 10s
 
@@ -141,8 +141,11 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     rew_action_rate: float = -0.01
     rew_feet_air_time: float = 0.25  # official Go2 flat
     rew_flat_orientation: float = -2.5  # official Go2 flat
-
-    # TODO: removed non-official rewards (hip_dev, joint_dev, gait_trot, leg_smooth, base_height)
+    # Gait posture (LegoManip_Lab: prevents limping/asymmetry)
+    rew_joint_mirror: float = -0.15  # penalize asymmetric leg pairs
+    rew_air_time_variance: float = -1.0  # penalize irregular stepping rhythm
+    rew_feet_slide: float = -0.1  # penalize foot dragging
+    rew_feet_long_air: float = -0.5  # penalize keeping a foot lifted too long
 
     # Reward std parameters
     lin_vel_tracking_std: float = math.sqrt(0.25)
