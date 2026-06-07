@@ -67,6 +67,9 @@ save/
 # Generated planner maps
 **/utils/map/*.png
 
+# Map textures (large binary files, tracked via DVC or manual sync)
+**/maps/usd/*/textures/
+
 # Tests
 tests/
 

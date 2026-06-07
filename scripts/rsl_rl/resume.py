@@ -1,34 +1,38 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # All rights reserved.
-#
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Resume training from a saved checkpoint — no Hydra, just argparse + manual config."""
+"""Resume training from a checkpoint — no Hydra, manual config.
+
+Two modes:
+  1. Same-folder (default): logs continue in the checkpoint's parent directory.
+  2. Fresh-folder (--fresh):  read model from any path, create new timestamped
+     log directory under logs/rsl_rl/<experiment_name>/ like a fresh train.
+"""
 
 import argparse
-import sys
 import os
+import sys
 import time
 import logging
 from datetime import datetime
 
 from isaaclab.app import AppLauncher
 
-# ---- argparse (all our own, no cli_args / Hydra) ----
+# ---- argparse ----
 parser = argparse.ArgumentParser(description="Resume RL training from a checkpoint.")
 parser.add_argument("--task", type=str, required=True)
 parser.add_argument("--num_envs", type=int, default=32)
 parser.add_argument("--max_iterations", type=int, default=None)
-parser.add_argument("--resume_path", type=str, required=True, help="Path to checkpoint .pt file")
+parser.add_argument("--resume_path", type=str, required=True, help="Path to model .pt checkpoint")
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument(
+    "--fresh", action="store_true", default=False,
+    help="Create a new timestamped log directory instead of continuing in the checkpoint folder",
+)
 
-# AppLauncher / render args (provides --device, --headless, --enable_cameras, etc.)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-
-# force enable_cameras to false unless explicitly set in headless mode
-if not getattr(args_cli, 'enable_cameras', False):
-    args_cli.enable_cameras = False
 
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
@@ -38,7 +42,6 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import torch
-# (NaviSpotRL mode env var removed — not needed for DogArm)
 
 from rsl_rl.runners import OnPolicyRunner
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
@@ -57,7 +60,7 @@ torch.backends.cudnn.benchmark = False
 
 
 def main():
-    # ---- Load configs directly (no Hydra) ----
+    # ---- Load configs ----
     env_cfg = load_cfg_from_registry(args_cli.task.split(":")[-1], "env_cfg_entry_point")
     agent_cfg = load_cfg_from_registry(args_cli.task.split(":")[-1], "rsl_rl_cfg_entry_point")
 
@@ -67,7 +70,6 @@ def main():
     agent_cfg.device = args_cli.device
     agent_cfg.seed = args_cli.seed
 
-    # Handle deprecated config fields (distribution_cfg -> stochastic etc.)
     import importlib.metadata as metadata
     rsl_version = metadata.version("rsl-rl-lib")
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, rsl_version)
@@ -78,9 +80,21 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     print(f"[INFO] Resuming from checkpoint: {checkpoint_path}")
 
-    # ---- Log directory (same run folder) ----
-    log_dir = os.path.dirname(checkpoint_path)
-    print(f"[INFO] Logging to: {log_dir}")
+    # ---- Log directory ----
+    if args_cli.fresh:
+        # New timestamped folder, like train.py does
+        log_root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if agent_cfg.run_name:
+            ts += f"_{agent_cfg.run_name}"
+        log_dir = os.path.join(log_root, ts)
+        os.makedirs(log_dir, exist_ok=True)
+        print(f"[INFO] Fresh log directory: {log_dir}")
+    else:
+        # Continue in the checkpoint's folder
+        log_dir = os.path.dirname(checkpoint_path)
+        print(f"[INFO] Logging to same folder: {log_dir}")
+
     env_cfg.log_dir = log_dir
 
     # ---- Create env ----
@@ -98,9 +112,9 @@ def main():
     print(f"[INFO] Loading model checkpoint from: {checkpoint_path}")
     runner.load(checkpoint_path)
 
-    # Compute remaining iterations (rsl_rl learn(N) means "train N MORE iterations")
+    # Compute remaining iterations
     if args_cli.max_iterations is not None:
-        start_it = runner.current_learning_iteration  # e.g. 2100
+        start_it = runner.current_learning_iteration
         remaining = max(1, args_cli.max_iterations - start_it)
         agent_cfg.max_iterations = remaining
         total = start_it + remaining

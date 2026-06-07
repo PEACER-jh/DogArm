@@ -13,7 +13,7 @@ from isaaclab.assets.articulation import ArticulationCfg
 
 # Path to the USD asset
 _current_dir = os.path.dirname(os.path.abspath(__file__))
-GO2ARM_USD_PATH = os.path.join(_current_dir, "go2_arm.usd")
+GO2ARM_USD_PATH = os.path.join(_current_dir, "usd", "go2_arm.usd")
 
 GO2ARM_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(

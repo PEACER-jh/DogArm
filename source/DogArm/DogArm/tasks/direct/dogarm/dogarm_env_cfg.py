@@ -16,7 +16,9 @@ import math
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
+from isaaclab.terrains import TerrainGeneratorCfg
 from isaaclab.utils import configclass
+import isaaclab.terrains as terrain_gen
 from ....robots.go2arm import (
     ALL_JOINT_NAMES,
     ARM_JOINT_NAMES,
@@ -55,11 +57,11 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     }
 
     # -- Observation history --
-    num_obs_history_steps: int = 10  # 10-step history stack
+    num_obs_history_steps: int = 10 # 10-step history stack
 
     # -- Simulation --
     sim: SimulationCfg = SimulationCfg(
-        dt=0.005,  # 200 Hz physics
+        dt=0.005,                   # 200 Hz physics
         render_interval=decimation,
         physx=PhysxCfg(
             gpu_max_rigid_patch_count=10 * 2**15,
@@ -74,6 +76,29 @@ class DogarmEnvCfg(DirectRLEnvCfg):
         num_envs=4096,
         env_spacing=2.5,
         replicate_physics=True,
+    )
+
+    # -- Terrain --
+    terrain_type: str = "cs2map"  # "plane" | "rough" | "cs2map"
+    cs2_map_name: str = "dust2"  # which CS2 map to load
+
+    rough_terrain_cfg: TerrainGeneratorCfg = TerrainGeneratorCfg(
+        size=(200.0, 200.0),
+        border_width=0.0,
+        num_rows=1,
+        num_cols=1,               # single continuous block
+        horizontal_scale=0.1,
+        vertical_scale=0.005,
+        slope_threshold=0.75,
+        use_cache=False,
+        sub_terrains={
+            "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+                proportion=1.0,
+                noise_range=(-0.05, 0.05),  # gravel texture
+                noise_step=0.01,              # fine grid
+                border_width=0.0,
+            ),
+        },
     )
 
     # ========================================================================
@@ -105,6 +130,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     rew_target_progress: float = 8.0
     rew_target_reach: float = 20.0
     rew_target_alignment: float = 1.0
+    rew_forward_speed: float = 2.0  # locomotion scaffold: reward moving forward
     vel_cmd_resample_time_range: tuple[float, float] = (10.0, 10.0)  # Go2Arm_Lab: 10s
 
     # TODO(target+EE): restore when adding navigation + manipulation

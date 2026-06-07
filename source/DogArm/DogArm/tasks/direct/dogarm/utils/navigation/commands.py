@@ -66,8 +66,9 @@ def velocity_toward_target(
     tgt_dist = torch.norm(to_target_w, dim=-1, keepdim=True)
     tgt_dir_w = to_target_w / (tgt_dist + 1e-6)
 
-    # Robot forward in world frame
-    fwd = _mu.quat_apply(robot_quat_w[env_ids], forward_vec_b)
+    # Robot forward in world frame (handle per-env or single forward vec)
+    fwd_vec = forward_vec_b[env_ids] if forward_vec_b.ndim == 2 else forward_vec_b
+    fwd = _mu.quat_apply(robot_quat_w[env_ids], fwd_vec)
     robot_yaw = torch.atan2(fwd[:, 1], fwd[:, 0])
 
     # Target yaw

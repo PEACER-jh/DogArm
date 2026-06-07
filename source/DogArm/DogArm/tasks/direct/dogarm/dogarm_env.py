@@ -39,6 +39,8 @@ import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.terrains import TerrainImporter, TerrainImporterCfg
+from ....maps.cs2map import DUST2_SPAWN_CFG, load_walkable_vertices
 
 from .dogarm_env_cfg import DogarmEnvCfg
 from .utils.rewards import (
@@ -150,13 +152,58 @@ class DogarmEnv(DirectRLEnv):
             self.target_pos = torch.zeros(self.num_envs, 3, device=self.device)
             self._prev_distance = torch.zeros(self.num_envs, device=self.device)
 
+        # CS2 map: load walkable vertices for robot spawning
+        if cfg.terrain_type == "cs2map":
+            self._spawn_verts = load_walkable_vertices(self.device)
+
     # === Scene ================================================================
 
     def _setup_scene(self) -> None:
         self.robot = Articulation(self.cfg.robot_cfg)
-        spawn_ground_plane("/World/ground", GroundPlaneCfg())
+
+        # Terrain: plane / rough / cs2map
+        if self.cfg.terrain_type == "rough":
+            terrain_cfg = TerrainImporterCfg(
+                prim_path="/World/ground",
+                terrain_type="generator",
+                terrain_generator=self.cfg.rough_terrain_cfg,
+                num_envs=self.cfg.scene.num_envs,
+                env_spacing=self.cfg.scene.env_spacing,
+                use_terrain_origins=True,
+                collision_group=-1,
+                physics_material=sim_utils.RigidBodyMaterialCfg(
+                    friction_combine_mode="multiply",
+                    restitution_combine_mode="multiply",
+                    static_friction=1.0,
+                    dynamic_friction=1.0,
+                ),
+                debug_vis=False,
+            )
+            self.terrain = TerrainImporter(terrain_cfg)
+        elif self.cfg.terrain_type == "cs2map":
+            # Shared map: load USD, then add rigid body + collision to every mesh
+            DUST2_SPAWN_CFG.func("/World/Map", DUST2_SPAWN_CFG)
+            # Apply rigid body + collision API to all mesh prims recursively
+            import omni.usd
+            from pxr import Usd, UsdGeom, UsdPhysics
+
+            stage = omni.usd.get_context().get_stage()
+            for prim in Usd.PrimRange(stage.GetPrimAtPath("/World/Map")):
+                if prim.IsA(UsdGeom.Mesh):
+                    UsdPhysics.RigidBodyAPI.Apply(prim)
+                    UsdPhysics.CollisionAPI.Apply(prim)
+                    rb = UsdPhysics.RigidBodyAPI.Get(stage, prim.GetPath())
+                    if rb:
+                        rb.GetKinematicEnabledAttr().Set(True)
+        else:
+            spawn_ground_plane("/World/ground", GroundPlaneCfg())
+
         self.scene.clone_environments(copy_from_source=False)
         self.scene.articulations["robot"] = self.robot
+
+        # Rough terrain: spawn at ground level like plane mode
+        if self.cfg.terrain_type == "rough":
+            pass  # env_origins Z=0, same as plane
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
@@ -200,6 +247,17 @@ class DogarmEnv(DirectRLEnv):
                 self.vel_cmd_timers[vel_ids] = torch.rand(len(vel_ids), device=self.device) * (dr[1] - dr[0]) + dr[0]
             self._heading_to_body_vel()
         else:  # navigation
+            # Resample target point when reached
+            target_dist = torch.norm(self.target_pos[:, :2] - self.robot.data.root_pos_w[:, :2], dim=-1)
+            reached = target_dist < self.cfg.target_reach_threshold
+            if reached.any():
+                r_ids = torch.where(reached)[0]
+                self.target_pos[r_ids] = nav_cmd.sample_target_points(
+                    r_ids, self.robot.data.root_pos_w[:, :2],
+                    self.cfg.target_distance_range, self.device)
+                self._prev_distance[r_ids] = torch.norm(
+                    self.target_pos[r_ids, :2] - self.robot.data.root_pos_w[r_ids, :2], dim=-1)
+
             if vel_needs.any():
                 vel_ids = torch.where(vel_needs)[0]
                 new_cmds = nav_cmd.velocity_toward_target(
@@ -317,12 +375,16 @@ class DogarmEnv(DirectRLEnv):
         # === Reward terms (Go2Arm_Lab locomotion baseline) ===
         rewards = torch.zeros(self.num_envs, device=self.device)
 
-        # Velocity tracking (velocity mode only — this IS the task)
+        # Velocity / speed scaffold
         if self.cfg.task_mode == "velocity":
             rewards += self.cfg.rew_lin_vel_tracking * lin_vel_tracking_exp(
                 vel_cmd[:, :2], root_lin_vel_b[:, :2], self.cfg.lin_vel_tracking_std)
             rewards += self.cfg.rew_ang_vel_tracking * ang_vel_tracking_exp(
                 vel_cmd[:, 2], root_ang_vel_b[:, 2], self.cfg.ang_vel_tracking_std)
+        else:
+            # Navigation: low-weight vel tracking as locomotion scaffold
+            rewards += 0.5 * lin_vel_tracking_exp(
+                vel_cmd[:, :2], root_lin_vel_b[:, :2], self.cfg.lin_vel_tracking_std)
 
         # Stability
         rewards += self.cfg.rew_lin_vel_z * lin_vel_z_l2(root_lin_vel_b[:, 2])
@@ -368,6 +430,8 @@ class DogarmEnv(DirectRLEnv):
             fwd_w = math_utils.quat_apply(self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B)[:, :2]
             tgt_dir = (self.target_pos[:, :2] - root_pos_w[:, :2]) / (target_dist.unsqueeze(-1) + 1e-6)
             rewards += self.cfg.rew_target_alignment * nav_rewards.target_alignment(fwd_w, tgt_dir)
+            # Instant forward speed × alignment: encourages stepping toward target
+            rewards += self.cfg.rew_forward_speed * root_lin_vel_b[:, 0] * nav_rewards.target_alignment(fwd_w, tgt_dir).clamp(min=0.0)
             self._prev_distance = target_dist
 
         # TODO(arm): restore ee_pos_tracking, ee_ori_tracking, ee_action_rate, ee_action_smoothness
@@ -386,8 +450,13 @@ class DogarmEnv(DirectRLEnv):
         bad_orientation = tilt_angle > 0.75
 
         base_height = self.robot.data.body_state_w[:, self.base_body_idx, 2]
-        base_too_low = base_height < 0.05
-        base_collapsed = base_height < 0.22
+        # cs2map: ground Z varies across map, only use orientation-based death
+        if self.cfg.terrain_type == "cs2map":
+            base_too_low = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            base_collapsed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        else:
+            base_too_low = base_height < 0.05
+            base_collapsed = base_height < 0.22
         body_inverted = projected_gravity[:, 2] > 0.2
 
         terminated = bad_orientation | base_too_low | base_collapsed | body_inverted
@@ -407,6 +476,14 @@ class DogarmEnv(DirectRLEnv):
             return
 
         super()._reset_idx(ids)
+
+        # CS2 map: override XY+Z with walkable area vertices
+        if self.cfg.terrain_type == "cs2map":
+            idx = torch.randint(0, self._spawn_verts.shape[0], (ids.numel(),), device=self.device)
+            spawn_pts = self._spawn_verts[idx]  # (n, 3)
+            self.scene.env_origins[ids, 0] = spawn_pts[:, 0]
+            self.scene.env_origins[ids, 1] = spawn_pts[:, 1]
+            self.scene.env_origins[ids, 2] = spawn_pts[:, 2]
 
         # Root state randomization
         default_root = randomize_root_state(
