@@ -120,8 +120,19 @@ def update_dogarm_markers(
 
     # === 4. EE target pose frame ===
     if has_ee_tgt and ee_tgt is not None:
-        ee_tgt_pos = ee_tgt[:, :3]
-        ee_tgt_quat = ee_tgt[:, 3:7]
+        # Align mode: EE is already world-frame (anchored at target)
+        # Other modes: EE might be body-frame, convert via link0
+        link0_idx = getattr(env, "link0_body_idx", None)
+        task_mode = getattr(env.cfg, "task_mode", "")
+        if link0_idx is not None and task_mode != "align":
+            link0_pose = env.robot.data.body_link_pose_w[:, link0_idx]
+            ee_tgt_pos, ee_tgt_quat = math_utils.combine_frame_transforms(
+                link0_pose[:, :3], link0_pose[:, 3:7],
+                ee_tgt[:, :3], ee_tgt[:, 3:7],
+            )
+        else:
+            ee_tgt_pos = ee_tgt[:, :3]
+            ee_tgt_quat = ee_tgt[:, 3:7]
     else:
         ee_tgt_pos = ee_curr_pos
         ee_tgt_quat = ee_curr_quat

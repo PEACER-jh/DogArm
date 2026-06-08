@@ -33,8 +33,8 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     """Configuration for the DogArm direct RL environment."""
 
     # -- Environment --
-    # -- Task mode ("velocity" | "navigation") --
-    task_mode: str = "velocity"
+    # -- Task mode ("velocity" | "navigation" | "align") --
+    task_mode: str = "align"
 
     decimation: int = 4  # 200Hz sim → 50Hz control
     episode_length_s: float = 20.0
@@ -79,7 +79,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     )
 
     # -- Terrain --
-    terrain_type: str = "cs2map"  # "plane" | "rough" | "cs2map"
+    terrain_type: str = "plane"  # "plane" | "rough" | "cs2map"
     cs2_map_name: str = "dust2"  # which CS2 map to load
 
     rough_terrain_cfg: TerrainGeneratorCfg = TerrainGeneratorCfg(
@@ -113,7 +113,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     # Action scales
     # ========================================================================
     leg_action_scale: float = 0.25
-    arm_action_scale: float = 0.0  # TODO(arm): set to 0.5 when adding arm tasks
+    arm_action_scale: float = 0.1  # conservative for align; velocity/nav set to 0
 
     # ========================================================================
     # Command generation
@@ -125,6 +125,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     vel_cmd_heading_range: tuple[float, float] = (-3.14, 3.14)
 
     # -- Navigation mode params --
+    nav_vel_speed_range: tuple[float, float] = (0.03, 0.15)  # slower, stable walk
     target_distance_range: tuple[float, float] = (1.5, 4.0)
     target_reach_threshold: float = 0.3
     rew_target_progress: float = 8.0
@@ -133,12 +134,28 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     rew_forward_speed: float = 2.0  # locomotion scaffold: reward moving forward
     vel_cmd_resample_time_range: tuple[float, float] = (10.0, 10.0)  # Go2Arm_Lab: 10s
 
-    # TODO(target+EE): restore when adding navigation + manipulation
-    # arm_base_body_name: str = "shoulder_link"
-    # ee_cmd_sphere_center_z: float = 0.35
-    # ee_cmd_arm_length: float = 0.55
-    # ee_cmd_rpy_range = {...}
-    # ee_cmd_resample_time_range = (6.0, 8.0)
+    # -- Align mode params --
+    align_vel_speed_range: tuple[float, float] = (0.03, 0.15)  # slower, stable walk
+    arm_base_body_name: str = "shoulder_link"  # link0 for body-frame EE commands
+    align_target_distance_range: tuple[float, float] = (1.5, 3.0)  # target point
+    align_target_reach_threshold: float = 0.5  # close enough for arm
+    ee_cmd_arm_length: float = 0.55  # max arm reach [m]
+    ee_cmd_min_radius: float = 0.15  # min radius to avoid self-collision
+    ee_cmd_theta_range: tuple[float, float] = (-math.pi / 2, math.pi / 2)
+    ee_cmd_phi_range: tuple[float, float] = (0.0, math.pi / 2)
+    ee_cmd_rpy_range: dict = {
+        "roll": (-math.pi / 4, math.pi / 4),
+        "pitch": (-math.pi / 4, math.pi / 4),
+        "yaw": (-math.pi / 4, math.pi / 4),
+    }
+    ee_cmd_resample_time_range: tuple[float, float] = (6.0, 8.0)
+    rew_ee_pos_tracking: float = 5.0  # stronger position pull
+    rew_ee_ori_tracking: float = -2.0
+    rew_ee_action_rate: float = -0.005
+    rew_ee_action_smoothness: float = -0.02
+    ee_pos_tracking_std: float = 0.3  # wider tolerance for early training
+    rew_align_forward_speed: float = 2.0
+    align_curriculum_steps: tuple[int, int, int] = (120000, 240000, 360000)
 
     # Curriculum
     curriculum_coeff: int = 1000
@@ -146,13 +163,6 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     # ========================================================================
     # Reward weights
     # ========================================================================
-    # TODO(arm): rew_ee_* when adding manipulation
-    # ee_active_dist_threshold: float = 1.0
-    # rew_ee_pos_tracking: float = 2.5
-    # rew_ee_ori_tracking: float = -1.5
-    # rew_ee_action_rate: float = -0.005
-    # rew_ee_action_smoothness: float = -0.02
-
     # Velocity tracking
     rew_lin_vel_tracking: float = 1.5
     rew_ang_vel_tracking: float = 0.75

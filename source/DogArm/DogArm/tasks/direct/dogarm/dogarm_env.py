@@ -68,6 +68,9 @@ from .utils.velocity import observations as vel_obs
 from .utils.navigation import commands as nav_cmd
 from .utils.navigation import rewards as nav_rewards
 from .utils.navigation import observations as nav_obs
+from .utils.align import commands as align_cmd
+from .utils.align import rewards as align_rewards
+from .utils.align import observations as align_obs
 
 
 class DogarmEnv(DirectRLEnv):
@@ -82,7 +85,6 @@ class DogarmEnv(DirectRLEnv):
     thigh_calf_idx: torch.Tensor
     ee_body_idx: int  # needed for viz
     base_body_idx: int
-    # TODO(target+EE): restore link0_body_idx when adding arm tasks
     foot_body_idx: torch.Tensor
 
     # State buffers
@@ -91,11 +93,6 @@ class DogarmEnv(DirectRLEnv):
     cmd_speed: torch.Tensor  # commanded forward speed
     vel_cmd_timers: torch.Tensor
     push_timers: torch.Tensor
-    # TODO(target+EE): restore when adding navigation + manipulation
-    # target_pos: torch.Tensor
-    # ee_pose_commands: torch.Tensor
-    # ee_cmd_timers: torch.Tensor
-    # _prev_distance: torch.Tensor
     obs_history: torch.Tensor
     obs_history_idx: int
     prev_actions: torch.Tensor
@@ -108,9 +105,16 @@ class DogarmEnv(DirectRLEnv):
     ee_tgt_frame_markers: object
 
     def __init__(self, cfg: DogarmEnvCfg, render_mode: Optional[str] = None, **kwargs: object) -> None:
-        # Set observation dim based on task mode (must happen before super().__init__)
+        # Set obs/action dim and arm scale based on task mode (before super().__init__)
         if cfg.task_mode == "navigation":
             cfg.observation_space = 67  # velocity(61) + target(6)
+        elif cfg.task_mode == "align":
+            cfg.observation_space = 80  # 67 base + 6 target + 7 EE
+            cfg.action_space = 18  # 12 legs + 6 arms
+        else:  # velocity
+            cfg.arm_action_scale = 0.0  # arm fixed
+        if cfg.task_mode == "navigation":
+            cfg.arm_action_scale = 0.0  # arm fixed in nav too
         super().__init__(cfg, render_mode, **kwargs)
 
         # Joints
@@ -127,7 +131,10 @@ class DogarmEnv(DirectRLEnv):
         self.ee_body_idx = ee_ids[0]
         base_ids, _ = self.robot.find_bodies(["base"])
         self.base_body_idx = base_ids[0]
-        # TODO(target+EE): self.link0_body_idx = ...
+        # Arm base for align mode
+        if cfg.task_mode == "align":
+            link0_ids, _ = self.robot.find_bodies([cfg.arm_base_body_name])
+            self.link0_body_idx = link0_ids[0]
         foot_ids, _ = self.robot.find_bodies(["FR_foot", "FL_foot", "RR_foot", "RL_foot"])
         self.foot_body_idx = torch.tensor(foot_ids, device=self.device, dtype=torch.long)
 
@@ -150,6 +157,13 @@ class DogarmEnv(DirectRLEnv):
         # Navigation mode extras
         if cfg.task_mode == "navigation":
             self.target_pos = torch.zeros(self.num_envs, 3, device=self.device)
+            self._prev_distance = torch.zeros(self.num_envs, device=self.device)
+
+        # Align mode extras
+        if cfg.task_mode == "align":
+            self.target_pos = torch.zeros(self.num_envs, 3, device=self.device)
+            self.ee_pose_commands = torch.zeros(self.num_envs, 7, device=self.device)
+            self.ee_cmd_timers = torch.zeros(self.num_envs, device=self.device)
             self._prev_distance = torch.zeros(self.num_envs, device=self.device)
 
         # CS2 map: load walkable vertices for robot spawning
@@ -239,7 +253,27 @@ class DogarmEnv(DirectRLEnv):
         self.vel_cmd_timers -= self.step_dt
         vel_needs = self.vel_cmd_timers <= 0.0
 
-        if self.cfg.task_mode == "velocity":
+        if self.cfg.task_mode == "align":
+            # Curriculum: dynamic arm_scale + action mode + target distance
+            s = self._curriculum_step
+            p1, p2, p3 = self.cfg.align_curriculum_steps
+            if s < p1:
+                self._dyn_arm_scale, self._dyn_dist = 0.0, (0.5, 1.0)
+            elif s < p2:
+                self._dyn_arm_scale, self._dyn_dist = 0.1, (0.5, 1.0)
+            elif s < p3:
+                self._dyn_arm_scale, self._dyn_dist = 0.2, (0.8, 1.5)
+            else:
+                self._dyn_arm_scale, self._dyn_dist = 0.5, (1.5, 3.0)
+
+            # Velocity toward target (locomotion scaffold)
+            self.vel_commands = align_cmd.velocity_toward_target(
+                self.robot.data.root_pos_w[:, :2], self.target_pos,
+                self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B,
+                self.cfg.align_vel_speed_range, self.device,
+            )
+
+        elif self.cfg.task_mode == "velocity":
             if vel_needs.any():
                 vel_ids = torch.where(vel_needs)[0]
                 self._resample_heading_command(vel_ids)
@@ -264,7 +298,7 @@ class DogarmEnv(DirectRLEnv):
                     vel_ids, self.robot.data.root_pos_w[:, :2], self.target_pos,
                     self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B,
                     self._curriculum_step, self.cfg.curriculum_coeff,
-                    self.cfg.vel_cmd_speed_range_init, self.cfg.vel_cmd_speed_range_final,
+                    self.cfg.nav_vel_speed_range, self.cfg.nav_vel_speed_range,
                     self.device,
                 )
                 self.vel_commands[vel_ids] = new_cmds
@@ -277,7 +311,7 @@ class DogarmEnv(DirectRLEnv):
                     self.robot.data.root_pos_w[:, :2], self.target_pos,
                     self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B,
                     self._curriculum_step, self.cfg.curriculum_coeff,
-                    self.cfg.vel_cmd_speed_range_init, self.cfg.vel_cmd_speed_range_final,
+                    self.cfg.nav_vel_speed_range, self.cfg.nav_vel_speed_range,
                     self.device,
                 )
                 self.vel_commands = new_cmds
@@ -288,11 +322,15 @@ class DogarmEnv(DirectRLEnv):
 
     def _apply_action(self) -> None:
         actions = torch.clamp(self.actions, -1.0, 1.0)
-        leg_actions = actions * self.cfg.leg_action_scale
-
+        leg_act = actions[:, :12] * self.cfg.leg_action_scale
         default_pos = self.robot.data.default_joint_pos[:, self.dof_idx]
         target_pos = default_pos.clone()
-        target_pos[:, :12] += leg_actions
+        target_pos[:, :12] += leg_act
+        if actions.shape[1] > 12:  # align phases 2-4: arm active
+            arm_scale = getattr(self, "_dyn_arm_scale", self.cfg.arm_action_scale)
+            if arm_scale > 0:
+                arm_act = actions[:, 12:] * arm_scale
+                target_pos[:, 12:] += arm_act
         self.robot.set_joint_position_target(target_pos, joint_ids=self.dof_idx)
 
     # === Observations =========================================================
@@ -325,6 +363,27 @@ class DogarmEnv(DirectRLEnv):
                 base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
                 prev_actions, vel_cmds, projected_gravity, base_height,
             )  # (B, 61)
+        elif self.cfg.task_mode == "align":
+            # Phase 1 (arm_scale=0): nav-style 67-dim + zero pad to 80
+            if getattr(self, "_dyn_arm_scale", 0.0) == 0.0:
+                pa = prev_actions.clone()
+                pa[:, 12:] = 0.0  # arm noise = 0
+                tgt_b, tgt_dist, cos_y, sin_y = nav_obs.target_to_body_frame(
+                    self.target_pos, root_pos, root_quat, self.robot.data.FORWARD_VEC_B)
+                policy_obs = torch.cat([
+                    base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
+                    pa[:, :12], vel_cmds, projected_gravity, base_height,
+                    tgt_b, tgt_dist, cos_y, sin_y,
+                    torch.zeros(self.num_envs, 13, device=self.device),  # pad: 80-67=13
+                ], dim=-1)
+            else:
+                policy_obs = align_obs.build_policy_obs(
+                    base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
+                    prev_actions, vel_cmds, projected_gravity, base_height,
+                    self.target_pos, root_pos, root_quat,
+                    self.robot.data.FORWARD_VEC_B,
+                    self.ee_pose_commands,  # body-frame in phases 2+ (within arm reach)
+                )  # (B, 80)
         else:
             policy_obs = nav_obs.build_policy_obs(
                 base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
@@ -375,12 +434,43 @@ class DogarmEnv(DirectRLEnv):
         # === Reward terms (Go2Arm_Lab locomotion baseline) ===
         rewards = torch.zeros(self.num_envs, device=self.device)
 
-        # Velocity / speed scaffold
+        # Velocity / EE tracking (task-specific)
         if self.cfg.task_mode == "velocity":
             rewards += self.cfg.rew_lin_vel_tracking * lin_vel_tracking_exp(
                 vel_cmd[:, :2], root_lin_vel_b[:, :2], self.cfg.lin_vel_tracking_std)
             rewards += self.cfg.rew_ang_vel_tracking * ang_vel_tracking_exp(
                 vel_cmd[:, 2], root_ang_vel_b[:, 2], self.cfg.ang_vel_tracking_std)
+        elif self.cfg.task_mode == "align":
+            to_tgt = self.target_pos[:, :2] - root_pos_w[:, :2]
+            tgt_dist = torch.norm(to_tgt, dim=-1)
+            fwd_w = math_utils.quat_apply(self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B)[:, :2]
+            tgt_dir = to_tgt / (tgt_dist.unsqueeze(-1) + 1e-6)
+            alignment = torch.sum(fwd_w * tgt_dir, dim=-1)
+
+            if getattr(self, "_dyn_arm_scale", 0.0) == 0.0:
+                # Phase 1: nav-style rewards (learn to walk)
+                rewards += self.cfg.rew_target_progress * nav_rewards.target_progress(
+                    self._prev_distance, tgt_dist)
+                rewards += self.cfg.rew_target_alignment * alignment
+                rewards += self.cfg.rew_forward_speed * root_lin_vel_b[:, 0] * alignment.clamp(min=0.0)
+                self._prev_distance = tgt_dist.clone()
+            else:
+                # Phase 2+: EE tracking (body-frame EE → world-frame comparison)
+                link0_pose = self.robot.data.body_link_pose_w[:, self.link0_body_idx]
+                ee_tgt_pos_w, ee_tgt_quat_w = math_utils.combine_frame_transforms(
+                    link0_pose[:, :3], link0_pose[:, 3:7],
+                    self.ee_pose_commands[:, :3], self.ee_pose_commands[:, 3:7],
+                )
+                ee_curr_pos_w = self.robot.data.body_link_pose_w[:, self.ee_body_idx, :3]
+                ee_curr_quat_w = self.robot.data.body_link_pose_w[:, self.ee_body_idx, 3:7]
+                rewards += self.cfg.rew_ee_pos_tracking * align_rewards.ee_pos_tracking_exp(
+                    ee_curr_pos_w, ee_tgt_pos_w, self.cfg.ee_pos_tracking_std)
+                rewards += self.cfg.rew_ee_ori_tracking * align_rewards.ee_ori_tracking(
+                    ee_curr_quat_w, ee_tgt_quat_w)
+                arm_actions = self.actions[:, 12:]
+                prev_arm = self.prev_actions[:, 12:]
+                rewards += self.cfg.rew_ee_action_rate * action_rate_l2(arm_actions, prev_arm)
+                rewards += self.cfg.rew_align_forward_speed * root_lin_vel_b[:, 0] * alignment.clamp(min=0.0)
         else:
             # Navigation: low-weight vel tracking as locomotion scaffold
             rewards += 0.5 * lin_vel_tracking_exp(
@@ -434,7 +524,6 @@ class DogarmEnv(DirectRLEnv):
             rewards += self.cfg.rew_forward_speed * root_lin_vel_b[:, 0] * nav_rewards.target_alignment(fwd_w, tgt_dir).clamp(min=0.0)
             self._prev_distance = target_dist
 
-        # TODO(arm): restore ee_pos_tracking, ee_ori_tracking, ee_action_rate, ee_action_smoothness
 
         self.prev_actions = actions.clone()
         self.prev_leg_dof_vel = leg_joint_vel.clone()
@@ -513,6 +602,28 @@ class DogarmEnv(DirectRLEnv):
                 ids, robot_xy, self.cfg.target_distance_range, self.device)
             self._prev_distance[ids] = torch.norm(
                 self.target_pos[ids, :2] - robot_xy[ids], dim=-1)
+
+        # Align: generate target point + EE at target
+        if self.cfg.task_mode == "align":
+            robot_xy = self.robot.data.root_pos_w[:, :2]
+            dist_range = getattr(self, "_dyn_dist", (0.5, 1.0))
+            self.target_pos[ids] = align_cmd.sample_target_points(
+                ids, robot_xy, dist_range, self.device)
+            self._prev_distance[ids] = torch.norm(
+                self.target_pos[ids, :2] - robot_xy[ids], dim=-1)
+            # Phase 1: world-frame EE anchored at target; Phase 2+: body-frame EE
+            if getattr(self, "_dyn_arm_scale", 0.0) == 0.0:
+                new_ee = align_cmd.sample_ee_pose_at_target(
+                    ids, self.target_pos, 0.35, self.cfg.ee_cmd_arm_length,
+                    self.cfg.ee_cmd_rpy_range, self.device,
+                )
+            else:
+                new_ee = align_cmd.sample_ee_pose_body_frame(
+                    ids, self.cfg.ee_cmd_arm_length, self.cfg.ee_cmd_min_radius,
+                    self.cfg.ee_cmd_theta_range, self.cfg.ee_cmd_phi_range,
+                    self.cfg.ee_cmd_rpy_range, self.device,
+                )
+            self.ee_pose_commands[ids] = new_ee
 
         # Initial heading command (world-frame heading + speed)
         self._resample_heading_command(ids)
