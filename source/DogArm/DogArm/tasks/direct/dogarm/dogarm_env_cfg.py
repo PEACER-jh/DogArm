@@ -34,7 +34,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
 
     # -- Environment --
     # -- Task mode ("velocity" | "navigation" | "align") --
-    task_mode: str = "align"
+    task_mode: str = "velocity"
 
     decimation: int = 4  # 200Hz sim → 50Hz control
     episode_length_s: float = 20.0
@@ -79,7 +79,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     )
 
     # -- Terrain --
-    terrain_type: str = "plane"  # "plane" | "rough" | "cs2map"
+    terrain_type: str = "rough"  # "plane" | "rough" | "cs2map"
     cs2_map_name: str = "dust2"  # which CS2 map to load
 
     rough_terrain_cfg: TerrainGeneratorCfg = TerrainGeneratorCfg(
@@ -118,6 +118,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     # ========================================================================
     # Command generation
     # ========================================================================
+    # -- Velocity command params --
     # Velocity heading command — world-frame heading + body-frame speed
     # Robot must turn to match the world-frame heading then walk at the given speed.
     vel_cmd_speed_range_init: tuple[float, float] = (0.05, 0.3)
@@ -135,10 +136,8 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     vel_cmd_resample_time_range: tuple[float, float] = (10.0, 10.0)  # Go2Arm_Lab: 10s
 
     # -- Align mode params --
-    align_vel_speed_range: tuple[float, float] = (0.03, 0.15)  # slower, stable walk
     arm_base_body_name: str = "shoulder_link"  # link0 for body-frame EE commands
-    align_target_distance_range: tuple[float, float] = (1.5, 3.0)  # target point
-    align_target_reach_threshold: float = 0.5  # close enough for arm
+    align_target_distance_range: tuple[float, float] = (1.5, 3.0)  # EE anchor point
     ee_cmd_arm_length: float = 0.55  # max arm reach [m]
     ee_cmd_min_radius: float = 0.15  # min radius to avoid self-collision
     ee_cmd_theta_range: tuple[float, float] = (-math.pi / 2, math.pi / 2)
@@ -154,7 +153,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     rew_ee_action_rate: float = -0.005
     rew_ee_action_smoothness: float = -0.02
     ee_pos_tracking_std: float = 0.3  # wider tolerance for early training
-    rew_align_forward_speed: float = 2.0
+    rew_align_forward_speed: float = 2.0  # walk scaffold toward EE direction
     align_curriculum_steps: tuple[int, int, int] = (120000, 240000, 360000)
 
     # Curriculum

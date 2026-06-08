@@ -164,7 +164,6 @@ class DogarmEnv(DirectRLEnv):
             self.target_pos = torch.zeros(self.num_envs, 3, device=self.device)
             self.ee_pose_commands = torch.zeros(self.num_envs, 7, device=self.device)
             self.ee_cmd_timers = torch.zeros(self.num_envs, device=self.device)
-            self._prev_distance = torch.zeros(self.num_envs, device=self.device)
 
         # CS2 map: load walkable vertices for robot spawning
         if cfg.terrain_type == "cs2map":
@@ -254,24 +253,18 @@ class DogarmEnv(DirectRLEnv):
         vel_needs = self.vel_cmd_timers <= 0.0
 
         if self.cfg.task_mode == "align":
-            # Curriculum: dynamic arm_scale + action mode + target distance
+            # Curriculum: arm_scale only
             s = self._curriculum_step
             p1, p2, p3 = self.cfg.align_curriculum_steps
             if s < p1:
-                self._dyn_arm_scale, self._dyn_dist = 0.0, (0.5, 1.0)
+                self._dyn_arm_scale = 0.0
             elif s < p2:
-                self._dyn_arm_scale, self._dyn_dist = 0.1, (0.5, 1.0)
+                self._dyn_arm_scale = 0.1
             elif s < p3:
-                self._dyn_arm_scale, self._dyn_dist = 0.2, (0.8, 1.5)
+                self._dyn_arm_scale = 0.2
             else:
-                self._dyn_arm_scale, self._dyn_dist = 0.5, (1.5, 3.0)
-
-            # Velocity toward target (locomotion scaffold)
-            self.vel_commands = align_cmd.velocity_toward_target(
-                self.robot.data.root_pos_w[:, :2], self.target_pos,
-                self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B,
-                self.cfg.align_vel_speed_range, self.device,
-            )
+                self._dyn_arm_scale = 0.5
+            # vel_cmd = 0 — EE pos in obs gives direction
 
         elif self.cfg.task_mode == "velocity":
             if vel_needs.any():
@@ -364,26 +357,29 @@ class DogarmEnv(DirectRLEnv):
                 prev_actions, vel_cmds, projected_gravity, base_height,
             )  # (B, 61)
         elif self.cfg.task_mode == "align":
-            # Phase 1 (arm_scale=0): nav-style 67-dim + zero pad to 80
+            # Convert world-frame EE to body-frame (link0)
+            inv_q = math_utils.quat_conjugate(root_quat)  # approximate: link0 ≈ root
+            ee_pos_b = math_utils.quat_apply(inv_q, self.ee_pose_commands[:, :3] - root_pos)
+            ee_quat_b = math_utils.quat_mul(inv_q, self.ee_pose_commands[:, 3:7])
+
             if getattr(self, "_dyn_arm_scale", 0.0) == 0.0:
+                # Phase 1: pos only (61+3=64), pad to 80
                 pa = prev_actions.clone()
-                pa[:, 12:] = 0.0  # arm noise = 0
-                tgt_b, tgt_dist, cos_y, sin_y = nav_obs.target_to_body_frame(
-                    self.target_pos, root_pos, root_quat, self.robot.data.FORWARD_VEC_B)
+                pa[:, 12:] = 0.0
                 policy_obs = torch.cat([
                     base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
                     pa[:, :12], vel_cmds, projected_gravity, base_height,
-                    tgt_b, tgt_dist, cos_y, sin_y,
-                    torch.zeros(self.num_envs, 13, device=self.device),  # pad: 80-67=13
+                    ee_pos_b,
+                    torch.zeros(self.num_envs, 16, device=self.device),
                 ], dim=-1)
             else:
-                policy_obs = align_obs.build_policy_obs(
+                # Phase 2+: full EE (67+7=74), pad to 80
+                policy_obs = torch.cat([
                     base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
                     prev_actions, vel_cmds, projected_gravity, base_height,
-                    self.target_pos, root_pos, root_quat,
-                    self.robot.data.FORWARD_VEC_B,
-                    self.ee_pose_commands,  # body-frame in phases 2+ (within arm reach)
-                )  # (B, 80)
+                    ee_pos_b, ee_quat_b,
+                    torch.zeros(self.num_envs, 6, device=self.device),
+                ], dim=-1)
         else:
             policy_obs = nav_obs.build_policy_obs(
                 base_ang_vel, base_lin_vel, joint_pos_rel, joint_vel_rel,
@@ -441,36 +437,35 @@ class DogarmEnv(DirectRLEnv):
             rewards += self.cfg.rew_ang_vel_tracking * ang_vel_tracking_exp(
                 vel_cmd[:, 2], root_ang_vel_b[:, 2], self.cfg.ang_vel_tracking_std)
         elif self.cfg.task_mode == "align":
-            to_tgt = self.target_pos[:, :2] - root_pos_w[:, :2]
-            tgt_dist = torch.norm(to_tgt, dim=-1)
+            # Forward speed scaffold: reward walking toward EE direction
+            to_ee = self.ee_pose_commands[:, :2] - root_pos_w[:, :2]
+            ee_dist = torch.norm(to_ee, dim=-1, keepdim=True)
+            ee_dir = to_ee / (ee_dist + 1e-6)
             fwd_w = math_utils.quat_apply(self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B)[:, :2]
-            tgt_dir = to_tgt / (tgt_dist.unsqueeze(-1) + 1e-6)
-            alignment = torch.sum(fwd_w * tgt_dir, dim=-1)
+            rewards += self.cfg.rew_align_forward_speed * root_lin_vel_b[:, 0] * torch.sum(fwd_w * ee_dir, dim=-1).clamp(min=0.0)
 
+            # EE tracking
             if getattr(self, "_dyn_arm_scale", 0.0) == 0.0:
-                # Phase 1: nav-style rewards (learn to walk)
-                rewards += self.cfg.rew_target_progress * nav_rewards.target_progress(
-                    self._prev_distance, tgt_dist)
-                rewards += self.cfg.rew_target_alignment * alignment
-                rewards += self.cfg.rew_forward_speed * root_lin_vel_b[:, 0] * alignment.clamp(min=0.0)
-                self._prev_distance = tgt_dist.clone()
+                # Phase 1: position-only, arm locked
+                rewards += self.cfg.rew_ee_pos_tracking * align_rewards.ee_pos_tracking_exp(
+                    self.robot.data.body_link_pose_w[:, self.ee_body_idx, :3],
+                    self.ee_pose_commands[:, :3],  # world-frame EE position
+                    self.cfg.ee_pos_tracking_std)
             else:
-                # Phase 2+: EE tracking (body-frame EE → world-frame comparison)
+                # Phase 2+: position + orientation + arm penalties
                 link0_pose = self.robot.data.body_link_pose_w[:, self.link0_body_idx]
                 ee_tgt_pos_w, ee_tgt_quat_w = math_utils.combine_frame_transforms(
                     link0_pose[:, :3], link0_pose[:, 3:7],
                     self.ee_pose_commands[:, :3], self.ee_pose_commands[:, 3:7],
                 )
-                ee_curr_pos_w = self.robot.data.body_link_pose_w[:, self.ee_body_idx, :3]
-                ee_curr_quat_w = self.robot.data.body_link_pose_w[:, self.ee_body_idx, 3:7]
+                ee_c = self.robot.data.body_link_pose_w[:, self.ee_body_idx]
                 rewards += self.cfg.rew_ee_pos_tracking * align_rewards.ee_pos_tracking_exp(
-                    ee_curr_pos_w, ee_tgt_pos_w, self.cfg.ee_pos_tracking_std)
+                    ee_c[:, :3], ee_tgt_pos_w, self.cfg.ee_pos_tracking_std)
                 rewards += self.cfg.rew_ee_ori_tracking * align_rewards.ee_ori_tracking(
-                    ee_curr_quat_w, ee_tgt_quat_w)
-                arm_actions = self.actions[:, 12:]
+                    ee_c[:, 3:7], ee_tgt_quat_w)
+                arm_act = self.actions[:, 12:]
                 prev_arm = self.prev_actions[:, 12:]
-                rewards += self.cfg.rew_ee_action_rate * action_rate_l2(arm_actions, prev_arm)
-                rewards += self.cfg.rew_align_forward_speed * root_lin_vel_b[:, 0] * alignment.clamp(min=0.0)
+                rewards += self.cfg.rew_ee_action_rate * action_rate_l2(arm_act, prev_arm)
         else:
             # Navigation: low-weight vel tracking as locomotion scaffold
             rewards += 0.5 * lin_vel_tracking_exp(
@@ -603,27 +598,15 @@ class DogarmEnv(DirectRLEnv):
             self._prev_distance[ids] = torch.norm(
                 self.target_pos[ids, :2] - robot_xy[ids], dim=-1)
 
-        # Align: generate target point + EE at target
+        # Align: generate target point (viz only) + EE at target (world-frame)
         if self.cfg.task_mode == "align":
-            robot_xy = self.robot.data.root_pos_w[:, :2]
-            dist_range = getattr(self, "_dyn_dist", (0.5, 1.0))
             self.target_pos[ids] = align_cmd.sample_target_points(
-                ids, robot_xy, dist_range, self.device)
-            self._prev_distance[ids] = torch.norm(
-                self.target_pos[ids, :2] - robot_xy[ids], dim=-1)
-            # Phase 1: world-frame EE anchored at target; Phase 2+: body-frame EE
-            if getattr(self, "_dyn_arm_scale", 0.0) == 0.0:
-                new_ee = align_cmd.sample_ee_pose_at_target(
-                    ids, self.target_pos, 0.35, self.cfg.ee_cmd_arm_length,
-                    self.cfg.ee_cmd_rpy_range, self.device,
-                )
-            else:
-                new_ee = align_cmd.sample_ee_pose_body_frame(
-                    ids, self.cfg.ee_cmd_arm_length, self.cfg.ee_cmd_min_radius,
-                    self.cfg.ee_cmd_theta_range, self.cfg.ee_cmd_phi_range,
-                    self.cfg.ee_cmd_rpy_range, self.device,
-                )
-            self.ee_pose_commands[ids] = new_ee
+                ids, self.robot.data.root_pos_w[:, :2],
+                self.cfg.align_target_distance_range, self.device)
+            self.ee_pose_commands[ids] = align_cmd.sample_ee_pose_at_target(
+                ids, self.target_pos, 0.35, self.cfg.ee_cmd_arm_length,
+                self.cfg.ee_cmd_rpy_range, self.device,
+            )
 
         # Initial heading command (world-frame heading + speed)
         self._resample_heading_command(ids)
