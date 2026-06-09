@@ -27,6 +27,7 @@ def heading_to_body_vel(
     vel_commands[:, 2] = torch.clamp(heading_err, -1.0, 1.0)
 
 
+
 def resample_heading_command(
     n: int,
     curriculum_step: int,

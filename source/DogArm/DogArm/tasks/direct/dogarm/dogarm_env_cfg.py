@@ -79,7 +79,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     )
 
     # -- Terrain --
-    terrain_type: str = "rough"  # "plane" | "rough" | "cs2map"
+    terrain_type: str = "plane"  # "plane" | "rough" | "cs2map"
     cs2_map_name: str = "dust2"  # which CS2 map to load
 
     rough_terrain_cfg: TerrainGeneratorCfg = TerrainGeneratorCfg(
@@ -164,7 +164,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     # ========================================================================
     # Velocity tracking
     rew_lin_vel_tracking: float = 1.5
-    rew_ang_vel_tracking: float = 0.75
+    rew_ang_vel_tracking: float = 1.5
 
     # Leg locomotion / stability (official Go2 flat weights)
     rew_lin_vel_z: float = -2.0
