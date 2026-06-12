@@ -19,6 +19,12 @@ from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.terrains import TerrainGeneratorCfg
 from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
+from ....robots.go2 import (
+    GO2_ALL_JOINT_NAMES,
+    GO2_CFG,
+    GO2_EE_BODY_NAME,
+    GO2_LEG_JOINT_NAMES,
+)
 from ....robots.go2arm import (
     ALL_JOINT_NAMES,
     ARM_JOINT_NAMES,
@@ -33,8 +39,8 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     """Configuration for the DogArm direct RL environment."""
 
     # -- Environment --
-    # -- Task mode ("velocity" | "navigation" | "align") --
-    task_mode: str = "velocity"
+    robot_type: str = "go2"  # "go2arm" (Go2 + arm) | "go2" (Go2 legs only)
+    task_mode: str = "velocity"  # "velocity" | "navigation" | "align"
 
     decimation: int = 4  # 200Hz sim → 50Hz control
     episode_length_s: float = 20.0
@@ -57,7 +63,7 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     }
 
     # -- Observation history --
-    num_obs_history_steps: int = 10 # 10-step history stack
+    num_obs_history_steps: int = 5   # 5-step history — matches HIMLoco input dim
 
     # -- Simulation --
     sim: SimulationCfg = SimulationCfg(
@@ -79,24 +85,61 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     )
 
     # -- Terrain --
-    terrain_type: str = "plane"  # "plane" | "rough" | "cs2map"
+    terrain_type: str = "rough"  # "plane" | "rough" | "cs2map"
     cs2_map_name: str = "dust2"  # which CS2 map to load
 
     rough_terrain_cfg: TerrainGeneratorCfg = TerrainGeneratorCfg(
-        size=(200.0, 200.0),
+        size=(10.0, 10.0),
         border_width=0.0,
-        num_rows=1,
-        num_cols=1,               # single continuous block
+        num_rows=20,
+        num_cols=20,
         horizontal_scale=0.1,
         vertical_scale=0.005,
         slope_threshold=0.75,
         use_cache=False,
         sub_terrains={
+            "plane": terrain_gen.MeshPlaneTerrainCfg(
+                proportion=0.125,
+            ),
             "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-                proportion=1.0,
-                noise_range=(-0.05, 0.05),  # gravel texture
-                noise_step=0.01,              # fine grid
+                proportion=0.125,
+                noise_range=(-0.05, 0.10),
+                noise_step=0.02,
                 border_width=0.0,
+            ),
+            "pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+                proportion=0.125,
+                slope_range=(0.0, 0.4),
+                platform_width=1.5,
+            ),
+            "pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
+                proportion=0.125,
+                slope_range=(0.0, 0.4),
+                platform_width=1.5,
+            ),
+            "pyramid_stairs": terrain_gen.HfPyramidStairsTerrainCfg(
+                proportion=0.125,
+                step_height_range=(0.03, 0.15),
+                step_width=0.3,
+                platform_width=1.5,
+            ),
+            "pyramid_stairs_inv": terrain_gen.HfInvertedPyramidStairsTerrainCfg(
+                proportion=0.125,
+                step_height_range=(0.03, 0.15),
+                step_width=0.3,
+                platform_width=1.5,
+            ),
+            "discrete_obstacles": terrain_gen.HfDiscreteObstaclesTerrainCfg(
+                proportion=0.125,
+                obstacle_height_range=(0.05, 0.18),
+                obstacle_width_range=(0.4, 3.0),
+                num_obstacles=25,
+                platform_width=1.5,
+            ),
+            "wave": terrain_gen.HfWaveTerrainCfg(
+                proportion=0.125,
+                amplitude_range=(0.02, 0.08),
+                num_waves=3,
             ),
         },
     )
@@ -121,8 +164,10 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     # -- Velocity command params --
     # Velocity heading command — world-frame heading + body-frame speed
     # Robot must turn to match the world-frame heading then walk at the given speed.
-    vel_cmd_speed_range_init: tuple[float, float] = (0.05, 0.3)
-    vel_cmd_speed_range_final: tuple[float, float] = (0.1, 1.5)
+    # HIMLoco-style: wide range, small commands (<0.2 m/s) zeroed out.
+    vel_cmd_speed_range_init: tuple[float, float] = (0.2, 0.8)
+    vel_cmd_speed_range_final: tuple[float, float] = (0.2, 1.5)
+    vel_cmd_lateral_range: tuple[float, float] = (0.0, 0.6)
     vel_cmd_heading_range: tuple[float, float] = (-3.14, 3.14)
 
     # -- Navigation mode params --
@@ -162,25 +207,25 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     # ========================================================================
     # Reward weights
     # ========================================================================
-    # Velocity tracking
-    rew_lin_vel_tracking: float = 1.5
+    # Velocity tracking (HIMLoco-style: tight sigma, strong incentive)
+    rew_lin_vel_tracking: float = 3.0
     rew_ang_vel_tracking: float = 1.5
 
-    # Leg locomotion / stability (official Go2 flat weights)
-    rew_lin_vel_z: float = -2.0
+    # Leg locomotion / stability (rough terrain: relaxed for stairs & slopes)
+    rew_lin_vel_z: float = -0.5
     rew_ang_vel_xy: float = -0.05
-    rew_dof_torques: float = -2.0e-4  # official Go2: 20x our old weight
+    rew_dof_torques: float = -2.0e-4
     rew_dof_acc: float = -2.5e-7
     rew_action_rate: float = -0.01
-    rew_feet_air_time: float = 0.25  # official Go2 flat
-    rew_flat_orientation: float = -2.5  # official Go2 flat
+    rew_feet_air_time: float = 0.25
+    rew_flat_orientation: float = -0.5
     # Gait posture (LegoManip_Lab: prevents limping/asymmetry)
-    rew_joint_mirror: float = -0.15  # penalize asymmetric leg pairs
-    rew_air_time_variance: float = -1.0  # penalize irregular stepping rhythm
-    rew_feet_slide: float = -0.1  # penalize foot dragging
-    rew_feet_long_air: float = -0.5  # penalize keeping a foot lifted too long
+    rew_joint_mirror: float = -0.15
+    rew_air_time_variance: float = -1.0
+    rew_feet_slide: float = -0.03
+    rew_feet_long_air: float = -0.5
 
-    # Reward std parameters
+    # Reward std parameters (HIMLoco: tight sigma = 0.25)
     lin_vel_tracking_std: float = math.sqrt(0.25)
     ang_vel_tracking_std: float = math.sqrt(0.25)
 

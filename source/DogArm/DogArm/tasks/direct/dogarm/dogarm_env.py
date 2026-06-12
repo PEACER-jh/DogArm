@@ -91,6 +91,7 @@ class DogarmEnv(DirectRLEnv):
     vel_commands: torch.Tensor  # body-frame [vx, vy, wz]
     cmd_heading_w: torch.Tensor  # world-frame commanded heading
     cmd_speed: torch.Tensor  # commanded forward speed
+    cmd_lateral: torch.Tensor  # commanded lateral speed (+ right, - left)
     vel_cmd_timers: torch.Tensor
     push_timers: torch.Tensor
     obs_history: torch.Tensor
@@ -105,17 +106,44 @@ class DogarmEnv(DirectRLEnv):
     ee_tgt_frame_markers: object
 
     def __init__(self, cfg: DogarmEnvCfg, render_mode: Optional[str] = None, **kwargs: object) -> None:
-        # Set obs/action dim and arm scale based on task mode (before super().__init__)
+        # -- Robot model selection --
+        if cfg.robot_type == "go2":
+            from ....robots.go2 import (
+                GO2_ALL_JOINT_NAMES, GO2_CFG, GO2_EE_BODY_NAME, GO2_LEG_JOINT_NAMES,
+            )
+            cfg.robot_cfg = GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+            cfg.leg_joint_names = list(GO2_LEG_JOINT_NAMES)
+            cfg.arm_joint_names = []
+            cfg.all_joint_names = list(GO2_ALL_JOINT_NAMES)
+            cfg.ee_body_name = GO2_EE_BODY_NAME
+            cfg.arm_action_scale = 0.0
+            # Go2 has 12 joints (vs 18 with arm) — shrink obs/state dims
+            _n_joints = 12
+            _obs_dim = 3 + 3 + _n_joints + _n_joints + 12 + 3 + 3 + 1  # 49
+            cfg.action_space = 12
+            cfg.observation_space = _obs_dim
+            cfg.state_space = _obs_dim + _n_joints + 4  # 65
+
+        # Set obs/action dim and arm scale based on task mode
+        _base_obs = cfg.observation_space
         if cfg.task_mode == "navigation":
-            cfg.observation_space = 67  # velocity(61) + target(6)
+            cfg.observation_space = _base_obs + 6  # target-relative (6 dims)
+            cfg.arm_action_scale = 0.0
         elif cfg.task_mode == "align":
-            cfg.observation_space = 80  # 67 base + 6 target + 7 EE
+            if cfg.robot_type == "go2":
+                raise ValueError("Align task requires robot_type='go2arm'.")
+            cfg.observation_space = _base_obs + 6 + 7  # target + EE pose
             cfg.action_space = 18  # 12 legs + 6 arms
         else:  # velocity
             cfg.arm_action_scale = 0.0  # arm fixed
-        if cfg.task_mode == "navigation":
-            cfg.arm_action_scale = 0.0  # arm fixed in nav too
+        # Terrain handle — _setup_scene sets it for rough/cs2map;
+        # remains None for plane (created by spawn_ground_plane).
+        self.terrain: TerrainImporter | None = None
+
         super().__init__(cfg, render_mode, **kwargs)
+
+        # Stuck-detection counter (rough terrain: reset when robot is reset)
+        self._stuck_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
 
         # Joints
         self.dof_idx, _ = self.robot.find_joints(cfg.all_joint_names, preserve_order=True)
@@ -142,6 +170,7 @@ class DogarmEnv(DirectRLEnv):
         self.vel_commands = torch.zeros(self.num_envs, 3, device=self.device)
         self.cmd_heading_w = torch.zeros(self.num_envs, device=self.device)
         self.cmd_speed = torch.zeros(self.num_envs, device=self.device)
+        self.cmd_lateral = torch.zeros(self.num_envs, device=self.device)
         self.vel_cmd_timers = torch.zeros(self.num_envs, device=self.device)
         self.push_timers = torch.zeros(self.num_envs, device=self.device)
         self._init_push_timers()
@@ -214,9 +243,10 @@ class DogarmEnv(DirectRLEnv):
         self.scene.clone_environments(copy_from_source=False)
         self.scene.articulations["robot"] = self.robot
 
-        # Rough terrain: spawn at ground level like plane mode
-        if self.cfg.terrain_type == "rough":
-            pass  # env_origins Z=0, same as plane
+        # Rough terrain: terrain importer env_origins are used directly
+        # in _reset_idx and _get_dones (like AnymalCRoughEnv pattern).
+        # env_origins Z = per-cell max-height origin; robot base height
+        # (init_state.pos[2] = 0.4 m) provides clearance above surface.
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
@@ -231,15 +261,20 @@ class DogarmEnv(DirectRLEnv):
         """Delegate to velocity command module."""
         vel_cmd.heading_to_body_vel(
             self.robot.data.root_quat_w, self.robot.data.FORWARD_VEC_B,
-            self.cmd_heading_w, self.cmd_speed, self.vel_commands,
+            self.cmd_heading_w, self.cmd_speed, self.cmd_lateral, self.vel_commands,
         )
 
     def _resample_heading_command(self, env_ids: torch.Tensor) -> None:
         """Delegate to velocity command module."""
-        self.cmd_speed[env_ids], self.cmd_heading_w[env_ids] = vel_cmd.resample_heading_command(
+        (
+            self.cmd_speed[env_ids],
+            self.cmd_heading_w[env_ids],
+            self.cmd_lateral[env_ids],
+        ) = vel_cmd.resample_heading_command(
             len(env_ids), self._curriculum_step, self.cfg.curriculum_coeff,
             self.cfg.vel_cmd_speed_range_init, self.cfg.vel_cmd_speed_range_final,
-            self.cfg.vel_cmd_heading_range, self.device,
+            self.cfg.vel_cmd_lateral_range, self.cfg.vel_cmd_heading_range,
+            self.device,
         )
 
     # === Step =================================================================
@@ -395,12 +430,18 @@ class DogarmEnv(DirectRLEnv):
             [self.obs_history[:, (self.obs_history_idx + i) % hlen, :] for i in range(hlen)], dim=-1
         )  # (B, 640)
 
-        # Privileged critic obs (lin_vel already in policy, add torques + contacts)
-        joint_torques = self.robot.data.applied_torque[:, self.dof_idx]
+        # Privileged critic obs.
+        # Clip velocity and torque spikes (from terrain drops/impacts)
+        # before feeding to Critic — prevents value explosion on rough terrain.
+        safe_lin_vel = policy_obs[:, 3:6].clamp(-5.0, 5.0)
+        safe_torques = self.robot.data.applied_torque[:, self.dof_idx].clamp(-100.0, 100.0)
         foot_h = self.robot.data.body_state_w[:, self.foot_body_idx, 2]
         foot_contacts = (foot_h < 0.03).float()
 
-        critic_obs = torch.cat([policy_obs, joint_torques, foot_contacts], dim=-1)  # (B, 89)
+        # Rebuild policy_obs with clipped lin_vel
+        _p_obs = policy_obs.clone()
+        _p_obs[:, 3:6] = safe_lin_vel
+        critic_obs = torch.cat([_p_obs, safe_torques, foot_contacts], dim=-1)  # (B, 89)
         return {"obs": obs_stacked, "critic": critic_obs}
 
     # === Rewards ==============================================================
@@ -522,7 +563,26 @@ class DogarmEnv(DirectRLEnv):
 
         self.prev_actions = actions.clone()
         self.prev_leg_dof_vel = leg_joint_vel.clone()
-        return torch.clamp(rewards, -20.0, 500.0)
+        # Clamp per-step reward — clip negatives to zero (Go2W / HIMLoco
+        # "only_positive_rewards"): prevents the robot from learning that
+        # standing still (reward 0) is better than walking badly (reward <0).
+        return torch.clamp(rewards, 0.0, 5.0)
+
+    # === Settle ===============================================================
+
+    def _settle_robot(self, env_ids: torch.Tensor, num_steps: int) -> None:
+        """Let the robot drop onto the terrain surface using physics.
+
+        Args:
+            env_ids: Env indices to settle.
+            num_steps: Number of physics steps to run (200 Hz each).
+        """
+        default_joint_pos = self.robot.data.default_joint_pos[env_ids]
+        for _ in range(num_steps):
+            self.robot.set_joint_position_target(default_joint_pos, env_ids)
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+        self.scene.update(dt=self.physics_dt)
 
     # === Termination ==========================================================
 
@@ -534,16 +594,38 @@ class DogarmEnv(DirectRLEnv):
         bad_orientation = tilt_angle > 0.75
 
         base_height = self.robot.data.body_state_w[:, self.base_body_idx, 2]
-        # cs2map: ground Z varies across map, only use orientation-based death
-        if self.cfg.terrain_type == "cs2map":
+        body_inverted = projected_gravity[:, 2] > 0.2
+        # Side/front tip-over: gravity vector is nearly horizontal
+        pg_xy_norm = torch.norm(projected_gravity[:, :2], dim=-1)
+        tipped_over = pg_xy_norm > 0.85  # tilt > 58° in any direction
+        # Base collapsed onto feet (front/side fall where body hits ground)
+        foot_z_mean = self.robot.data.body_state_w[:, self.foot_body_idx, 2].mean(dim=-1)
+        collapsed = (base_height - foot_z_mean) < 0.08
+
+        # Stuck detection: robot can't move despite velocity commands
+        speed = torch.norm(self.robot.data.root_lin_vel_b[:, :2], dim=-1)
+        self._stuck_steps = torch.where(
+            speed < 0.05,
+            self._stuck_steps + 1,
+            torch.zeros_like(self._stuck_steps),
+        )
+
+        if self.cfg.terrain_type == "rough":
+            base_too_low = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            base_collapsed = collapsed
+            bad_orientation = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            body_inverted = body_inverted | tipped_over
+            stuck = self._stuck_steps > 150  # 3 s @ 50 Hz
+        elif self.cfg.terrain_type == "cs2map":
             base_too_low = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             base_collapsed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         else:
             base_too_low = base_height < 0.05
             base_collapsed = base_height < 0.22
-        body_inverted = projected_gravity[:, 2] > 0.2
 
         terminated = bad_orientation | base_too_low | base_collapsed | body_inverted
+        if self.cfg.terrain_type == "rough":
+            terminated = terminated | stuck
         return terminated, time_out
 
     # === Reset ================================================================
@@ -569,9 +651,17 @@ class DogarmEnv(DirectRLEnv):
             self.scene.env_origins[ids, 1] = spawn_pts[:, 1]
             self.scene.env_origins[ids, 2] = spawn_pts[:, 2]
 
-        # Root state randomization
+        # Root state randomization.
+        # For rough terrain, use terrain importer origins which include
+        # per-cell Z heights (like AnymalCRoughEnv does).
+        # For plane / cs2map, use scene default grid origins.
+        env_origins = (
+            self.terrain.env_origins
+            if self.cfg.terrain_type == "rough" and self.terrain is not None
+            else self.scene.env_origins
+        )
         default_root = randomize_root_state(
-            self.robot.data.default_root_state, self.scene.env_origins, ids,
+            self.robot.data.default_root_state, env_origins, ids,
             self.cfg.dr_pose_range, self.cfg.dr_velocity_range, self.device,
         )
 
@@ -584,9 +674,23 @@ class DogarmEnv(DirectRLEnv):
         self.robot.write_root_state_to_sim(default_root, ids)
         self.robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos), None, ids)
 
+        # Rough terrain: log terrain Z range on first reset.
+        # env_origins carry per-cell Z from the terrain generator.
+        # Gravity in the first policy step pulls each robot onto the
+        # actual surface beneath its spawn point.
+        if self.cfg.terrain_type == "rough" and self.terrain is not None:
+            if not getattr(self, "_initial_settle_logged", False):
+                self._initial_settle_logged = True
+                z_all = self.terrain.env_origins[:, 2]
+                print(f"[INIT] terrain origins Z: "
+                      f"min={z_all.min().item():.3f}  "
+                      f"max={z_all.max().item():.3f}  "
+                      f"mean={z_all.mean().item():.3f} m")
+
         # Reset internal
         self.actions[ids] = 0.0
         self.prev_actions[ids] = 0.0
+        self._stuck_steps[ids] = 0
         self.prev_leg_dof_vel[ids] = 0.0
         self.obs_history[ids] = 0.0
 

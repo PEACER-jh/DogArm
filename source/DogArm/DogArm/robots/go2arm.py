@@ -35,7 +35,7 @@ GO2ARM_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.4),  # standing height
+        pos=(0.0, 0.0, 0.3),    # standing height
         joint_pos={
             # Leg joints
             ".*L_hip_joint": 0.1,
