@@ -144,6 +144,9 @@ class DogarmEnv(DirectRLEnv):
 
         # Stuck-detection counter (rough terrain: reset when robot is reset)
         self._stuck_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+        # Episode distance tracking for terrain curriculum
+        self._episode_distance = torch.zeros(self.num_envs, device=self.device)
+        self._prev_root_xy = torch.zeros(self.num_envs, 2, device=self.device)
 
         # Joints
         self.dof_idx, _ = self.robot.find_joints(cfg.all_joint_names, preserve_order=True)
@@ -209,6 +212,7 @@ class DogarmEnv(DirectRLEnv):
                 prim_path="/World/ground",
                 terrain_type="generator",
                 terrain_generator=self.cfg.rough_terrain_cfg,
+                max_init_terrain_level=4,       # start easy (levels 0-4 out of 9)
                 num_envs=self.cfg.scene.num_envs,
                 env_spacing=self.cfg.scene.env_spacing,
                 use_terrain_origins=True,
@@ -534,11 +538,11 @@ class DogarmEnv(DirectRLEnv):
         self._foot_air_accum = 0.8 * self._foot_air_accum + 0.2 * foot_in_air
         rewards += self.cfg.rew_feet_air_time * torch.sum(self._foot_air_accum, dim=-1)
 
-        # Gait posture (LegoManip: symmetry + rhythm)
-        rewards += self.cfg.rew_joint_mirror * gait_trot_penalty(joint_pos)
-        # Air time variance: penalize irregular stepping (one foot lifted much longer than others)
+        # Gait posture symmetry + rhythm — fade in over first 2000 iters
+        _gait_scale = min(1.0, self._curriculum_step / 2000.0)
+        rewards += self.cfg.rew_joint_mirror * _gait_scale * gait_trot_penalty(joint_pos)
         air_var = torch.var(self._foot_air_accum, dim=-1)
-        rewards += self.cfg.rew_air_time_variance * air_var
+        rewards += self.cfg.rew_air_time_variance * _gait_scale * air_var
         # Foot slide: penalize foot velocity when near ground
         foot_vel = self.robot.data.body_lin_vel_w[:, self.foot_body_idx]  # (B, 4, 3)
         foot_slide = torch.norm(foot_vel[:, :, :2], dim=-1) * (foot_h < 0.03).float()
@@ -563,8 +567,21 @@ class DogarmEnv(DirectRLEnv):
 
         self.prev_actions = actions.clone()
         self.prev_leg_dof_vel = leg_joint_vel.clone()
+
+        # Track episode distance for terrain curriculum
+        root_xy = root_pos_w[:, :2]
+        self._episode_distance += torch.norm(root_xy - self._prev_root_xy, dim=-1)
+        self._prev_root_xy = root_xy
+
         # Clamp per-step reward — clip negatives to zero (Go2W / HIMLoco
-        # "only_positive_rewards"): prevents the robot from learning that
+        # Stand-still penalty (HIMLoco-style): when commanded to move
+        # but robot barely moves, penalize to discourage freezing.
+        cmd_speed = torch.norm(vel_cmd[:, :2], dim=-1)
+        body_speed = torch.norm(root_lin_vel_b[:, :2], dim=-1)
+        stand_still = (cmd_speed > 0.2) & (body_speed < 0.05)
+        rewards += stand_still.float() * -0.5
+
+        # "only_positive_rewards": prevents the robot from learning that
         # standing still (reward 0) is better than walking badly (reward <0).
         return torch.clamp(rewards, 0.0, 5.0)
 
@@ -615,7 +632,7 @@ class DogarmEnv(DirectRLEnv):
             base_collapsed = collapsed
             bad_orientation = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             body_inverted = body_inverted | tipped_over
-            stuck = self._stuck_steps > 150  # 3 s @ 50 Hz
+            stuck = self._stuck_steps > 75   # 1.5 s @ 50 Hz — quick kill on rough terrain
         elif self.cfg.terrain_type == "cs2map":
             base_too_low = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             base_collapsed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -691,6 +708,16 @@ class DogarmEnv(DirectRLEnv):
         self.actions[ids] = 0.0
         self.prev_actions[ids] = 0.0
         self._stuck_steps[ids] = 0
+
+        # Terrain curriculum: move up/down based on episode distance
+        if self.cfg.terrain_type == "rough" and self.terrain is not None:
+            dist = self._episode_distance[ids]
+            # Move up if robot covered ≥ 5 m, down if barely moved (< 0.5 m)
+            move_up = dist > 5.0
+            move_down = dist < 0.5
+            self.terrain.update_env_origins(ids, move_up, move_down)
+        self._episode_distance[ids] = 0.0
+        self._prev_root_xy[ids] = self.robot.data.root_pos_w[ids, :2]
         self.prev_leg_dof_vel[ids] = 0.0
         self.obs_history[ids] = 0.0
 

@@ -27,9 +27,9 @@ class DogarmPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """PPO runner configuration for DogArm Go2+arm task."""
 
     # -- Runner --
-    num_steps_per_env = 48  # HIMLoco default — more trajectory context per update
+    num_steps_per_env = 24
     max_iterations = 15000
-    save_interval = 1000
+    save_interval = 500
     check_for_nan = True  # LeggedManip_Lab: catch nan early
     experiment_name = "go2arm_direct"
     run_name = ""

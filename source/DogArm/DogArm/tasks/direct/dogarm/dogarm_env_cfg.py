@@ -70,7 +70,8 @@ class DogarmEnvCfg(DirectRLEnvCfg):
         dt=0.005,                   # 200 Hz physics
         render_interval=decimation,
         physx=PhysxCfg(
-            gpu_max_rigid_patch_count=10 * 2**15,
+            gpu_max_rigid_patch_count=40 * 2**15,   # 1.3M patch buffer (need ≥645K)
+            gpu_max_rigid_contact_count=2**23,       # default 8M
         ),
     )
 
@@ -89,57 +90,58 @@ class DogarmEnvCfg(DirectRLEnvCfg):
     cs2_map_name: str = "dust2"  # which CS2 map to load
 
     rough_terrain_cfg: TerrainGeneratorCfg = TerrainGeneratorCfg(
-        size=(10.0, 10.0),
+        size=(20.0, 20.0),
         border_width=0.0,
-        num_rows=20,
-        num_cols=20,
+        num_rows=10,
+        num_cols=10,
         horizontal_scale=0.1,
         vertical_scale=0.005,
         slope_threshold=0.75,
         use_cache=False,
+        curriculum=True,   # rows = difficulty levels for terrain curriculum
         sub_terrains={
             "plane": terrain_gen.MeshPlaneTerrainCfg(
                 proportion=0.125,
             ),
             "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
                 proportion=0.125,
-                noise_range=(-0.05, 0.10),
+                noise_range=(-0.01, 0.03),
                 noise_step=0.02,
                 border_width=0.0,
             ),
             "pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
                 proportion=0.125,
-                slope_range=(0.0, 0.4),
-                platform_width=1.5,
+                slope_range=(0.0, 0.12),            # ≤7° → max ~1.1 m on 20 m cell
+                platform_width=2.0,
             ),
             "pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
                 proportion=0.125,
-                slope_range=(0.0, 0.4),
-                platform_width=1.5,
+                slope_range=(0.0, 0.12),
+                platform_width=2.0,
             ),
             "pyramid_stairs": terrain_gen.HfPyramidStairsTerrainCfg(
                 proportion=0.125,
-                step_height_range=(0.03, 0.15),
-                step_width=0.3,
-                platform_width=1.5,
+                step_height_range=(0.03, 0.20),     # max ~9 steps × 20 cm ≈ 1.8 m
+                step_width=1.0,
+                platform_width=2.0,
             ),
             "pyramid_stairs_inv": terrain_gen.HfInvertedPyramidStairsTerrainCfg(
                 proportion=0.125,
-                step_height_range=(0.03, 0.15),
-                step_width=0.3,
-                platform_width=1.5,
+                step_height_range=(0.03, 0.20),
+                step_width=1.0,
+                platform_width=2.0,
             ),
             "discrete_obstacles": terrain_gen.HfDiscreteObstaclesTerrainCfg(
                 proportion=0.125,
                 obstacle_height_range=(0.05, 0.18),
-                obstacle_width_range=(0.4, 3.0),
-                num_obstacles=25,
+                obstacle_width_range=(0.3, 1.5),
+                num_obstacles=50,
                 platform_width=1.5,
             ),
             "wave": terrain_gen.HfWaveTerrainCfg(
                 proportion=0.125,
-                amplitude_range=(0.02, 0.08),
-                num_waves=3,
+                amplitude_range=(0.2, 0.9),   # peak ~0.9 m, trough ~-0.9 m → match stairs
+                num_waves=1,                    # single ridge
             ),
         },
     )
